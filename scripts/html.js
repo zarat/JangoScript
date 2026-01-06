@@ -1,20 +1,84 @@
-let io = new Console(); 
+let io = new Console();
 
-io.print("Hi"); 
+// Beispiel HTML-Dokument laden
+let html = """
+<html>
+  <head><title>Demo</title></head>
+  <body>
+    <h1 id="title">Beispielseite</h1>
 
-let h = """<div id="a"><span class="x">Hi</span></div>"""; 
+    <div class="content">
+      <p>Erster Absatz mit <b>fett</b> und <i>kursiv</i>.</p>
+      <p>Zweiter Absatz mit einem <a href="https://example.com">Link</a>.</p>
+    </div>
 
-print(h); 
+    <ul id="nav">
+      <li><a href="/home">Home</a></li>
+      <li><a href="/about">Über uns</a></li>
+      <li><a href="/contact">Kontakt</a></li>
+    </ul>
+  </body>
+</html>
+""";
 
-let d = new HTML(h); 
+let d = new HTML(html);
 
-io.print("text: " + d.innerText("span.x") + "\n"); 
-io.print("innerHTML(div#a): " + d.innerHTML("div#a") + "\n"); 
+//
+// Grundfunktionen
+//
+io.print("=== Grundfunktionen ===\n");
+io.print("Titel: ", d.innerText("title"), "\n");
+io.print("H1 Text: ", d.innerText("h1#title"), "\n");
+io.print("InnerHTML der .content:\n", d.innerHTML(".content"), "\n\n");
 
-d.setAttr("span.x", "data-test", "123"); 
-io.print("attr: " + d.getAttr("span.x", "data-test") + "\n"); 
+//
+// Liste aller <a>-Elemente ausgeben
+//
+io.print("=== Alle <a>-Elemente ===\n");
 
-d.appendHTML("div#a", "<b>!</b>"); 
-d.setInnerText("span.x", "Hallo <welt>"); // wird escaped 
+let count = d.count("a");
+io.print("Gefundene Links: ", count, "\n");
 
-io.print("\nRESULT:\n" + d.html() + "\n");
+for (let i = 0; i < count; i++) {
+  let txt = d.innerTextAt("a", i);
+  let href = d.getAttrAt("a", i, "href");
+  io.print("a[", i, "]: ", txt, " (", href, ")\n");
+}
+
+//
+// Attribute setzen, Text ersetzen
+//
+io.print("\n=== Attribute / Text ändern ===\n");
+
+// Beispiel: Link öffnen in neuem Tab
+d.setAttrAt("a", 0, "target", "_blank");
+// Beispiel: Text von H1 ändern
+d.setInnerText("h1#title", "HTML-Testseite");
+// Beispiel: HTML in .content anhängen
+d.appendHTML(".content", "<p>Dritter Absatz mit <u>Unterstreichung</u>.</p>");
+
+//
+// Elemente löschen
+//
+io.print("\n=== Elemente löschen ===\n");
+d.removeAt("ul#nav li", 1);  // „Über uns“ entfernen
+io.print("Neuer Navigationsblock:\n", d.innerHTML("#nav"), "\n\n");
+
+//
+// Neues Element einfügen
+//
+io.print("=== Neues Element einfügen ===\n");
+d.prependHTML("body", "<div class='notice'> Dies ist eine Demo-Seite.</div>");
+
+//
+// Komplettes Ergebnis ausgeben
+//
+io.print("\n=== Ergebnis-HTML ===\n");
+io.print(d.html(), "\n");
+
+//
+// Fehlerbehandlung (Test ungültiger Selector)
+//
+io.print("\n=== Fehler-Test ===\n");
+d.setInnerText("xyz", "fail");
+io.print("error: ", d.error, "\n");
