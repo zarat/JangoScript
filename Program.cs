@@ -1110,10 +1110,45 @@ internal static class Program
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero)
                     return JsValue.Null();
-
+            
+                /*
                 string path = (a.Length > 0 && a[0].Type == Kind.String) ? a[0].String ?? "" : "";
                 string mode = (a.Length > 1 && a[1].Type == Kind.String) ? a[1].String ?? "r" : "r";
-
+                */
+            
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string mode = (a.Length > 1) ? (a[1].String ?? "r") : "r";
+            
+            
+                // --- Plattformunabhängige Normalisierung ---
+            
+                // 1. ~ (Home) unterstützen (Linux + Windows)
+                if (!string.IsNullOrEmpty(path))
+                {
+                    path = path.Trim();
+                    if (path.StartsWith("~"))
+                    {
+                        string home = Environment.GetFolderPath(Environment.SpecialFolder.UserProfile);
+                        if (path == "~")
+                            path = home;
+                        else if (path.StartsWith("~/") || path.StartsWith("~\\"))
+                            path = Path.Combine(home, path.Substring(2));
+                    }
+                }
+            
+                // 2. relative Pfade in absolute umwandeln (CurrentDirectory berücksichtigen)
+                if (!string.IsNullOrEmpty(path) && !Path.IsPathRooted(path))
+                {
+                    path = Path.GetFullPath(path);
+                }
+            
+                // 3. Leerpfade verhindern
+                if (string.IsNullOrWhiteSpace(path))
+                {
+                    throw new ArgumentException("File path cannot be empty.", nameof(path));
+                }
+            
+            
                 _js.RetainHandle(thisVal.Handle);
                 using JsObject obj = new JsObject(_js, thisVal.Handle, true);
                 obj.Set("_path", JsValue.FromString(path));
