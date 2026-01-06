@@ -2,7 +2,7 @@ let io = new Console();
 
 setTaskLimit(4);
 
-function default() {
+function runAndForget() {
 	let p = new Process();
 	p.FileName = "ping";
 	p.Arguments = "1.1.1.1 -n 3";
@@ -93,7 +93,7 @@ function parallel() {
 	print("=== END ===");
 }
 
-default();
+runAndForget();
 io.read();
 waitForResult();
 io.read();
