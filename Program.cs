@@ -14,6 +14,8 @@ using System.Xml;
 using System.Net;
 using System.Net.Http;
 using System.Reflection;
+using System.Collections;
+using YamlDotNet.Serialization;
 
 internal static class Program
 {
@@ -577,6 +579,257 @@ internal static class Program
     };
 
     #endregion
+
+    #region YAML Helpers 
+
+    private static int _yamlNextId = 1;
+
+    private sealed class YamlState
+    {
+        public JsonNode Root = new JsonObject();
+    }
+
+    private static readonly Dictionary<int, YamlState> _yaml = new();
+
+    private static readonly IDeserializer _yamlDes = new DeserializerBuilder()
+        .IgnoreUnmatchedProperties()
+        .Build();
+
+    private static readonly ISerializer _yamlSer = new SerializerBuilder()
+        .DisableAliases()
+        .Build();
+
+    private static JsonNode? YamlObjToJsonNode(object? o)
+    {
+        if (o == null) return null;
+
+        if (o is string s) return JsonValue.Create(s);
+        if (o is bool b) return JsonValue.Create(b);
+
+        if (o is int i) return JsonValue.Create(i);
+        if (o is long l) return JsonValue.Create(l);
+        if (o is double d) return JsonValue.Create(d);
+        if (o is float f) return JsonValue.Create((double)f);
+        if (o is decimal m) return JsonValue.Create((double)m);
+
+        if (o is DateTime dt)
+            return JsonValue.Create(dt.ToString("o", CultureInfo.InvariantCulture));
+
+        // YAML mappings: Dictionary<object, object>
+        if (o is IDictionary dict)
+        {
+            var jo = new JsonObject();
+            foreach (DictionaryEntry de in dict)
+            {
+                string key = de.Key?.ToString() ?? "";
+                jo[key] = YamlObjToJsonNode(de.Value);
+            }
+            return jo;
+        }
+
+        // YAML sequences: List<object>
+        if (o is IEnumerable en && o is not string)
+        {
+            var ja = new JsonArray();
+            foreach (var item in en)
+                ja.Add(YamlObjToJsonNode(item));
+            return ja;
+        }
+
+        return JsonValue.Create(o.ToString());
+    }
+
+    private static object? JsonNodeToYamlObj(JsonNode? node)
+    {
+        if (node == null) return null;
+
+        if (node is JsonValue jv)
+        {
+            if (jv.TryGetValue<string>(out var s)) return s;
+            if (jv.TryGetValue<bool>(out var b)) return b;
+            if (jv.TryGetValue<int>(out var i)) return i;
+            if (jv.TryGetValue<long>(out var l)) return l;
+            if (jv.TryGetValue<double>(out var d)) return d;
+            if (jv.TryGetValue<decimal>(out var m)) return m;
+
+            // fallback
+            return jv.ToJsonString();
+        }
+
+        if (node is JsonObject jo)
+        {
+            var d = new Dictionary<string, object?>(StringComparer.Ordinal);
+            foreach (var kv in jo)
+                d[kv.Key] = JsonNodeToYamlObj(kv.Value);
+            return d;
+        }
+
+        if (node is JsonArray ja)
+        {
+            var list = new List<object?>();
+            foreach (var item in ja)
+                list.Add(JsonNodeToYamlObj(item));
+            return list;
+        }
+
+        return node.ToJsonString();
+    }
+
+    private static JsValue YamlToJs(JsonNode? node)
+    {
+        if (node == null) return JsValue.Null();
+
+        if (node is JsonValue jv)
+        {
+            if (jv.TryGetValue<string>(out var s)) return JsValue.FromString(s ?? "");
+            if (jv.TryGetValue<bool>(out var b)) return JsValue.FromNumber(b ? 1 : 0);
+
+            if (jv.TryGetValue<int>(out var i)) return JsValue.FromNumber(i);
+            if (jv.TryGetValue<long>(out var l)) return JsValue.FromNumber(l);
+            if (jv.TryGetValue<double>(out var d)) return JsValue.FromNumber(d);
+
+            return JsValue.FromString(jv.ToJsonString());
+        }
+
+        // object/array -> YAML string
+        string y = _yamlSer.Serialize(JsonNodeToYamlObj(node) ?? new object());
+        return JsValue.FromString(y.TrimEnd());
+    }
+
+    private static JsonNode? JsToYamlNode(JsValue v, bool parseYaml, out string err)
+    {
+        err = "";
+
+        if (v.Type == Kind.Number) return JsonValue.Create(v.Number);
+
+        if (v.Type == Kind.String)
+        {
+            string s = v.String ?? "";
+
+            if (parseYaml)
+            {
+                try
+                {
+                    var obj = _yamlDes.Deserialize<object>(s);
+                    return YamlObjToJsonNode(obj);
+                }
+                catch (Exception ex)
+                {
+                    err = ex.Message;
+                    return null;
+                }
+            }
+
+            return JsonValue.Create(s);
+        }
+
+        // simple textual fallbacks
+        string t = v.String ?? "";
+        if (string.Equals(t, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        if (string.Equals(t, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
+        if (string.Equals(t, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
+
+        return JsonValue.Create(t);
+    }
+
+    // eigene GetParent-Variante für YamlState (kopiert von deinem JSON-GetParent)
+    private static bool EnsureRootType(YamlState st, object firstSeg, out string err)
+    {
+        err = "";
+        bool wantArray = firstSeg is int;
+        bool isArray = st.Root is JsonArray;
+        bool isObj = st.Root is JsonObject;
+
+        if (wantArray && !isArray)
+        {
+            if (isObj && (st.Root as JsonObject)!.Count == 0) { st.Root = new JsonArray(); return true; }
+            err = "Root is not an array.";
+            return false;
+        }
+        if (!wantArray && !isObj)
+        {
+            if (isArray && (st.Root as JsonArray)!.Count == 0) { st.Root = new JsonObject(); return true; }
+            err = "Root is not an object.";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool GetParent(YamlState st, List<object> segs, bool create, out JsonNode? parent, out object last, out string err)
+    {
+        parent = null;
+        last = segs[^1];
+        err = "";
+
+        if (segs.Count == 1)
+        {
+            parent = st.Root;
+            return true;
+        }
+
+        if (!EnsureRootType(st, segs[0], out err))
+            return false;
+
+        JsonNode? cur = st.Root;
+
+        for (int i = 0; i < segs.Count - 1; i++)
+        {
+            var seg = segs[i];
+            var nextSeg = segs[i + 1];
+            bool nextWantsArray = nextSeg is int;
+
+            if (seg is string key)
+            {
+                if (cur is not JsonObject jo)
+                {
+                    err = "Path walks through non-object.";
+                    return false;
+                }
+
+                if (!jo.TryGetPropertyValue(key, out var child) || child == null)
+                {
+                    if (!create) { parent = null; return true; }
+                    child = nextWantsArray ? new JsonArray() : new JsonObject();
+                    jo[key] = child;
+                }
+
+                cur = child;
+            }
+            else
+            {
+                int idx = (int)seg;
+                if (cur is not JsonArray ja)
+                {
+                    err = "Path walks through non-array.";
+                    return false;
+                }
+
+                if (idx < 0) { err = "Negative index."; return false; }
+
+                if (idx >= ja.Count)
+                {
+                    if (!create) { parent = null; return true; }
+                    while (ja.Count <= idx) ja.Add(null);
+                }
+
+                var child = ja[idx];
+                if (child == null)
+                {
+                    if (!create) { parent = null; return true; }
+                    child = nextWantsArray ? new JsonArray() : new JsonObject();
+                    ja[idx] = child;
+                }
+
+                cur = child;
+            }
+        }
+
+        parent = cur;
+        return true;
+    }
+
+    #endregion
+
 
     public static int Main(string[] args)
     {
@@ -2686,7 +2939,6 @@ internal static class Program
             json.DeclareToGlobals();
         }
 
-
         using (JsClass http = _js.CreateClass("HTTPRequest"))
         {
             // Encoding Resolver (wie bei File, aber wiederverwendbar hier)
@@ -3335,6 +3587,316 @@ internal static class Program
 
             http.DeclareToGlobals();
 
+        }
+
+        using (JsClass yaml = _js.CreateClass("YAML"))
+        {
+            yaml.AddMethod("constructor", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                int id = _yamlNextId++;
+                var st = new YamlState();
+                _yaml[id] = st;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("_id", JsValue.FromNumber(id));
+                obj.Set("error", JsValue.Null());
+
+                if (a.Length > 0 && a[0].Type == Kind.String)
+                {
+                    try
+                    {
+                        var o = _yamlDes.Deserialize<object>(a[0].String ?? "");
+                        st.Root = YamlObjToJsonNode(o) ?? new JsonObject();
+                    }
+                    catch (Exception ex)
+                    {
+                        obj.Set("error", JsValue.FromString(ex.Message));
+                    }
+                }
+
+                return JsValue.Null();
+            });
+
+            yaml.AddMethod("parse", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("YAML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                string text = (a.Length > 0) ? (a[0].String ?? "") : "";
+                try
+                {
+                    var o = _yamlDes.Deserialize<object>(text);
+                    st.Root = YamlObjToJsonNode(o) ?? new JsonObject();
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            yaml.AddMethod("yaml", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st)) return JsValue.Null();
+
+                string y = _yamlSer.Serialize(JsonNodeToYamlObj(st.Root));
+                return JsValue.FromString(y.TrimEnd());
+            });
+
+            yaml.AddMethod("get", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("YAML state missing."));
+                    return JsValue.Null();
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.Null();
+                }
+
+                var node = GetNode(st.Root, segs);
+                return YamlToJs(node);
+            });
+
+            // set(path, value, parseYamlFlag)
+            yaml.AddMethod("set", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+                JsValue val = (a.Length > 1) ? a[1] : JsValue.Null();
+                bool parseYaml = (a.Length > 2 && a[2].Type == Kind.Number && (int)a[2].Number != 0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("YAML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+                if (segs.Count == 0)
+                {
+                    obj.Set("error", JsValue.FromString("Empty target path. Use parse() to replace whole document."));
+                    return JsValue.FromNumber(0);
+                }
+
+                var node = JsToYamlNode(val, parseYaml, out var verr);
+                if (verr.Length > 0)
+                {
+                    obj.Set("error", JsValue.FromString(verr));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!GetParent(st, segs, create: true, out var parent, out var last, out var rerr))
+                {
+                    obj.Set("error", JsValue.FromString(rerr));
+                    return JsValue.FromNumber(0);
+                }
+                if (parent == null)
+                {
+                    obj.Set("error", JsValue.FromString("Parent missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) { obj.Set("error", JsValue.FromString("Target is not an object.")); return JsValue.FromNumber(0); }
+                        jo[key] = node;
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) { obj.Set("error", JsValue.FromString("Target is not an array.")); return JsValue.FromNumber(0); }
+                        while (ja.Count <= idx) ja.Add(null);
+                        ja[idx] = node;
+                    }
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            yaml.AddMethod("remove", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("YAML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+                if (segs.Count == 0) return JsValue.FromNumber(0);
+
+                if (!GetParent(st, segs, create: false, out var parent, out var last, out _))
+                    return JsValue.FromNumber(0);
+                if (parent == null) return JsValue.FromNumber(0);
+
+                try
+                {
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) return JsValue.FromNumber(0);
+                        return JsValue.FromNumber(jo.Remove(key) ? 1 : 0);
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) return JsValue.FromNumber(0);
+                        if (idx < 0 || idx >= ja.Count) return JsValue.FromNumber(0);
+                        ja.RemoveAt(idx);
+                        return JsValue.FromNumber(1);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            yaml.AddMethod("push", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+                JsValue val = (a.Length > 1) ? a[1] : JsValue.Null();
+                bool parseYaml = (a.Length > 2 && a[2].Type == Kind.Number && (int)a[2].Number != 0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_yaml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("YAML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+
+                var node = JsToYamlNode(val, parseYaml, out var verr);
+                if (verr.Length > 0)
+                {
+                    obj.Set("error", JsValue.FromString(verr));
+                    return JsValue.FromNumber(0);
+                }
+
+                var target = GetNode(st.Root, segs);
+                if (target == null)
+                {
+                    // create array at path
+                    if (!GetParent(st, segs, create: true, out var parent, out var last, out var rerr))
+                    {
+                        obj.Set("error", JsValue.FromString(rerr));
+                        return JsValue.FromNumber(0);
+                    }
+                    if (parent == null)
+                    {
+                        obj.Set("error", JsValue.FromString("Parent missing."));
+                        return JsValue.FromNumber(0);
+                    }
+
+                    var newArr = new JsonArray();
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) { obj.Set("error", JsValue.FromString("Target is not an object.")); return JsValue.FromNumber(0); }
+                        jo[key] = newArr;
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) { obj.Set("error", JsValue.FromString("Target is not an array.")); return JsValue.FromNumber(0); }
+                        while (ja.Count <= idx) ja.Add(null);
+                        ja[idx] = newArr;
+                    }
+                    target = newArr;
+                }
+
+                if (target is not JsonArray arr)
+                {
+                    obj.Set("error", JsValue.FromString("Target is not an array."));
+                    return JsValue.FromNumber(0);
+                }
+
+                arr.Add(node);
+                return JsValue.FromNumber(arr.Count);
+            });
+
+            yaml.AddMethod("free", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                return JsValue.FromNumber((id >= 0 && _yaml.Remove(id)) ? 1 : 0);
+            });
+
+            yaml.DeclareToGlobals();
         }
 
 
