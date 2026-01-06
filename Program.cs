@@ -1,12 +1,19 @@
+using CsvHelper;
+using CsvHelper.Configuration;
 using Fizzler.Systems.HtmlAgilityPack;
 using HtmlAgilityPack;
 using MiniJsHost;
 using System;
 using System.Globalization;
 using System.IO;
+using System.Reflection;
 using System.Text;
-using CsvHelper;
-using CsvHelper.Configuration;
+using System.Text.Json;
+using System.Text.Json.Nodes;
+using System.Xml;
+using System.Net;
+using System.Net.Http;
+using System.Reflection;
 
 internal static class Program
 {
@@ -242,6 +249,332 @@ internal static class Program
             IgnoreBlankLines = false
         };
     }
+
+    #endregion
+
+    #region XML Helpers
+
+    // irgendwo im Program:
+    private static int _xmlNextId = 1;
+
+    private sealed class XmlState
+    {
+        public XmlDocument Doc = new XmlDocument();
+        public XmlNamespaceManager Ns;
+
+        public XmlState()
+        {
+            Ns = new XmlNamespaceManager(Doc.NameTable);
+            Doc.PreserveWhitespace = true;
+            Doc.LoadXml("<root/>");
+        }
+    }
+
+    private static readonly Dictionary<int, XmlState> _xml = new();
+
+    #endregion
+
+    #region JSON Helpers
+
+    private static int _jsonNextId = 1;
+
+    private sealed class JsonState
+    {
+        public JsonNode Root = new JsonObject();
+    }
+
+    private static readonly Dictionary<int, JsonState> _json = new();
+
+    private static bool TryParsePath(string path, out List<object> segs, out string err)
+    {
+        segs = new List<object>();
+        err = "";
+
+        if (string.IsNullOrWhiteSpace(path))
+        {
+            err = "Empty path.";
+            return false;
+        }
+
+        path = path.Trim();
+
+        // JSON Pointer: /a/b/0
+        if (path.StartsWith("/"))
+        {
+            var parts = path.Split('/', StringSplitOptions.None);
+            for (int i = 1; i < parts.Length; i++)
+            {
+                string p = parts[i].Replace("~1", "/").Replace("~0", "~");
+                if (p.Length == 0) continue;
+
+                if (int.TryParse(p, out int idx)) segs.Add(idx);
+                else segs.Add(p);
+            }
+            return true;
+        }
+
+        // dot + [index]: a.b[0].c
+        int pos = 0;
+        while (pos < path.Length)
+        {
+            if (path[pos] == '.')
+            {
+                pos++;
+                continue;
+            }
+
+            // name
+            int start = pos;
+            while (pos < path.Length && path[pos] != '.' && path[pos] != '[')
+                pos++;
+
+            if (pos > start)
+            {
+                string name = path.Substring(start, pos - start).Trim();
+                if (name.Length > 0)
+                    segs.Add(name);
+            }
+
+            // [index] blocks
+            while (pos < path.Length && path[pos] == '[')
+            {
+                pos++; // skip '['
+                int s2 = pos;
+                while (pos < path.Length && path[pos] != ']') pos++;
+                if (pos >= path.Length)
+                {
+                    err = "Unclosed [ in path.";
+                    return false;
+                }
+
+                string inside = path.Substring(s2, pos - s2).Trim();
+                pos++; // skip ']'
+
+                if (!int.TryParse(inside, out int idx))
+                {
+                    err = "Only numeric [index] supported in dot-path. Use JSON Pointer for complex keys.";
+                    return false;
+                }
+                segs.Add(idx);
+            }
+        }
+
+        if (segs.Count == 0)
+        {
+            err = "Invalid path.";
+            return false;
+        }
+        return true;
+    }
+
+    private static bool EnsureRootType(JsonState st, object firstSeg, out string err)
+    {
+        err = "";
+        bool wantArray = firstSeg is int;
+        bool isArray = st.Root is JsonArray;
+        bool isObj = st.Root is JsonObject;
+
+        if (wantArray && !isArray)
+        {
+            if (isObj && (st.Root as JsonObject)!.Count == 0) { st.Root = new JsonArray(); return true; }
+            err = "Root is not an array.";
+            return false;
+        }
+        if (!wantArray && !isObj)
+        {
+            if (isArray && (st.Root as JsonArray)!.Count == 0) { st.Root = new JsonObject(); return true; }
+            err = "Root is not an object.";
+            return false;
+        }
+        return true;
+    }
+
+    private static JsonNode? GetNode(JsonNode root, List<object> segs)
+    {
+        JsonNode? cur = root;
+
+        foreach (var seg in segs)
+        {
+            if (cur == null) return null;
+
+            if (seg is string key)
+            {
+                if (cur is not JsonObject jo) return null;
+                if (!jo.TryGetPropertyValue(key, out var next)) return null;
+                cur = next;
+            }
+            else
+            {
+                int idx = (int)seg;
+                if (cur is not JsonArray ja) return null;
+                if (idx < 0 || idx >= ja.Count) return null;
+                cur = ja[idx];
+            }
+        }
+
+        return cur;
+    }
+
+    private static bool GetParent(JsonState st, List<object> segs, bool create, out JsonNode? parent, out object last, out string err)
+    {
+        parent = null;
+        last = segs[^1];
+        err = "";
+
+        if (segs.Count == 1)
+        {
+            parent = st.Root;
+            return true;
+        }
+
+        if (!EnsureRootType(st, segs[0], out err))
+            return false;
+
+        JsonNode? cur = st.Root;
+
+        for (int i = 0; i < segs.Count - 1; i++)
+        {
+            var seg = segs[i];
+            var nextSeg = segs[i + 1];
+            bool nextWantsArray = nextSeg is int;
+
+            if (seg is string key)
+            {
+                if (cur is not JsonObject jo)
+                {
+                    err = "Path walks through non-object.";
+                    return false;
+                }
+
+                if (!jo.TryGetPropertyValue(key, out var child) || child == null)
+                {
+                    if (!create)
+                    {
+                        parent = null;
+                        return true;
+                    }
+                    child = nextWantsArray ? new JsonArray() : new JsonObject();
+                    jo[key] = child;
+                }
+
+                cur = child;
+            }
+            else
+            {
+                int idx = (int)seg;
+                if (cur is not JsonArray ja)
+                {
+                    err = "Path walks through non-array.";
+                    return false;
+                }
+
+                if (idx < 0) { err = "Negative index."; return false; }
+
+                if (idx >= ja.Count)
+                {
+                    if (!create)
+                    {
+                        parent = null;
+                        return true;
+                    }
+                    while (ja.Count <= idx) ja.Add(null);
+                }
+
+                var child = ja[idx];
+                if (child == null)
+                {
+                    if (!create)
+                    {
+                        parent = null;
+                        return true;
+                    }
+                    child = nextWantsArray ? new JsonArray() : new JsonObject();
+                    ja[idx] = child;
+                }
+
+                cur = child;
+            }
+        }
+
+        parent = cur;
+        return true;
+    }
+
+    private static JsonNode? JsToJsonNode(JsValue v, bool parseJson, out string err)
+    {
+        err = "";
+
+        if (v.Type == Kind.Number)
+            return JsonValue.Create(v.Number);
+
+        if (v.Type == Kind.String)
+        {
+            string s = v.String ?? "";
+            if (parseJson)
+            {
+                try { return JsonNode.Parse(s); }
+                catch (Exception ex) { err = ex.Message; return null; }
+            }
+            return JsonValue.Create(s);
+        }
+
+        // fallback: try interpret textual value
+        string t = v.String ?? "";
+        if (string.Equals(t, "null", StringComparison.OrdinalIgnoreCase)) return null;
+        if (string.Equals(t, "true", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(true);
+        if (string.Equals(t, "false", StringComparison.OrdinalIgnoreCase)) return JsonValue.Create(false);
+
+        // last resort: string
+        return JsonValue.Create(t);
+    }
+
+    private static JsValue JsonToJs(JsonNode? node)
+    {
+        if (node == null) return JsValue.Null();
+
+        if (node is JsonValue jv)
+        {
+            if (jv.TryGetValue<string>(out var s)) return JsValue.FromString(s ?? "");
+            if (jv.TryGetValue<bool>(out var b)) return JsValue.FromNumber(b ? 1 : 0);
+            if (jv.TryGetValue<int>(out var i)) return JsValue.FromNumber(i);
+            if (jv.TryGetValue<long>(out var l)) return JsValue.FromNumber(l);
+            if (jv.TryGetValue<double>(out var d)) return JsValue.FromNumber(d);
+            return JsValue.FromString(jv.ToJsonString());
+        }
+
+        // object/array -> JSON string
+        return JsValue.FromString(node.ToJsonString());
+    }
+
+    #endregion
+
+    #region HTTP Helpers
+
+    private static int _httpNextId = 1;
+
+    private sealed class HttpState
+    {
+        public HttpResponseMessage? Resp;
+        public Stream? RespStream;
+        public StreamReader? RespReader;
+        public bool StreamBinary;
+
+        // Upload-“Streaming” (Buffer bis closestream -> dann senden)
+        public MemoryStream? Upload;
+        public Encoding UploadEnc = new UTF8Encoding(false);
+        public bool UploadBinary;
+    }
+
+    private static readonly Dictionary<int, HttpState> _http = new();
+
+    private static readonly HttpClient _httpClient = new HttpClient(new HttpClientHandler
+    {
+        AutomaticDecompression = DecompressionMethods.All,
+        AllowAutoRedirect = true
+    })
+    {
+        Timeout = Timeout.InfiniteTimeSpan
+    };
 
     #endregion
 
@@ -1290,6 +1623,1713 @@ internal static class Program
             csv.DeclareToGlobals();
 
         }
+
+        using (JsClass xml = _js.CreateClass("XML")) // Script: new XML()
+        {
+
+            xml.AddMethod("constructor", (JsValue[] a, JsValue thisVal) =>
+            {
+
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                int id = _xmlNextId++;
+                var st = new XmlState();
+                _xml[id] = st;
+
+                _js.RetainHandle(thisVal.Handle);
+                using (var obj = new JsObject(_js, thisVal.Handle, true))
+                {
+                    obj.Set("_id", JsValue.FromNumber(id));
+                    obj.Set("error", JsValue.Null());
+
+                    if (a.Length > 0 && a[0].Type == Kind.String)
+                    {
+                        string s = a[0].String ?? "";
+                        try
+                        {
+                            st.Doc = new XmlDocument { PreserveWhitespace = true };
+                            st.Ns = new XmlNamespaceManager(st.Doc.NameTable);
+                            st.Doc.LoadXml(s);
+                            _xml[id] = st; // update state
+                        }
+                        catch (Exception ex)
+                        {
+                            obj.Set("error", JsValue.FromString(ex.Message));
+                        }
+                    }
+                }
+
+                return JsValue.Null();
+            });
+
+            xml.AddMethod("free", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                return JsValue.FromNumber((id >= 0 && _xml.Remove(id)) ? 1 : 0);
+            });
+
+            xml.AddMethod("setXml", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                string s = (a.Length > 0) ? (a[0].String ?? "") : "";
+                try
+                {
+                    st.Doc = new XmlDocument { PreserveWhitespace = true };
+                    st.Ns = new XmlNamespaceManager(st.Doc.NameTable);
+                    st.Doc.LoadXml(s);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("xml", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st)) return JsValue.Null();
+
+                return JsValue.FromString(st.Doc.OuterXml ?? "");
+            });
+
+            xml.AddMethod("addNamespace", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                string prefix = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string uri = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    st.Ns.AddNamespace(prefix, uri);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("exists", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    return JsValue.FromNumber(n != null ? 1 : 0);
+                }
+                catch
+                {
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("count", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                try
+                {
+                    var list = st.Doc.SelectNodes(xp, st.Ns);
+                    return JsValue.FromNumber(list?.Count ?? 0);
+                }
+                catch
+                {
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("innerText", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.Null();
+                    return JsValue.FromString(n.InnerText ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            xml.AddMethod("innerXML", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.Null();
+                    return JsValue.FromString(n.InnerXml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            xml.AddMethod("outerXML", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.Null();
+                    return JsValue.FromString(n.OuterXml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            xml.AddMethod("setInnerText", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string txt = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.FromNumber(0);
+                    n.InnerText = txt ?? "";
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("setInnerXML", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string frag = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.FromNumber(0);
+                    n.InnerXml = frag ?? "";
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("appendXML", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string fragText = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.FromNumber(0);
+
+                    var frag = st.Doc.CreateDocumentFragment();
+                    frag.InnerXml = fragText ?? "";
+                    n.AppendChild(frag);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("prependXML", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string fragText = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.FromNumber(0);
+
+                    var frag = st.Doc.CreateDocumentFragment();
+                    frag.InnerXml = fragText ?? "";
+
+                    // Insert all children of fragment before first child
+                    var first = n.FirstChild;
+                    while (frag.FirstChild != null)
+                    {
+                        var child = frag.FirstChild;
+                        frag.RemoveChild(child);
+                        n.InsertBefore(child, first);
+                    }
+
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("getAttr", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string name = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns) as XmlElement;
+                    if (n == null) return JsValue.Null();
+                    if (!n.HasAttribute(name)) return JsValue.Null();
+                    return JsValue.FromString(n.GetAttribute(name) ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            xml.AddMethod("setAttr", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string name = (a.Length > 1) ? (a[1].String ?? "") : "";
+                string value = (a.Length > 2) ? (a[2].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns) as XmlElement;
+                    if (n == null) return JsValue.FromNumber(0);
+                    n.SetAttribute(name, value ?? "");
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("removeAttr", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+                string name = (a.Length > 1) ? (a[1].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns) as XmlElement;
+                    if (n == null) return JsValue.FromNumber(0);
+                    if (!n.HasAttribute(name)) return JsValue.FromNumber(0);
+                    n.RemoveAttribute(name);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.AddMethod("remove", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string xp = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_xml.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("XML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var n = st.Doc.SelectSingleNode(xp, st.Ns);
+                    if (n == null) return JsValue.FromNumber(0);
+                    if (n.ParentNode == null) return JsValue.FromNumber(0);
+                    n.ParentNode.RemoveChild(n);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            xml.DeclareToGlobals();
+
+        }
+
+        using (JsClass json = _js.CreateClass("JSON"))
+        {
+            json.AddMethod("constructor", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                int id = _jsonNextId++;
+                var st = new JsonState();
+                _json[id] = st;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("_id", JsValue.FromNumber(id));
+                obj.Set("error", JsValue.Null());
+
+                if (a.Length > 0 && a[0].Type == Kind.String)
+                {
+                    try
+                    {
+                        st.Root = JsonNode.Parse(a[0].String ?? "") ?? new JsonObject();
+                    }
+                    catch (Exception ex)
+                    {
+                        obj.Set("error", JsValue.FromString(ex.Message));
+                    }
+                }
+
+                return JsValue.Null();
+            });
+
+            json.AddMethod("parse", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                string text = (a.Length > 0) ? (a[0].String ?? "") : "";
+                try
+                {
+                    st.Root = JsonNode.Parse(text) ?? new JsonObject();
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            json.AddMethod("json", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.Null();
+
+                return JsValue.FromString(st.Root?.ToJsonString(new JsonSerializerOptions { WriteIndented = false }) ?? "null");
+            });
+
+            json.AddMethod("pretty", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.Null();
+
+                return JsValue.FromString(st.Root?.ToJsonString(new JsonSerializerOptions { WriteIndented = true }) ?? "null");
+            });
+
+            json.AddMethod("get", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.Null();
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.Null();
+                }
+
+                var node = GetNode(st.Root, segs);
+                return JsonToJs(node);
+            });
+
+            json.AddMethod("getJson", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.Null();
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.Null();
+                }
+
+                var node = GetNode(st.Root, segs);
+                if (node == null) return JsValue.Null();
+                return JsValue.FromString(node.ToJsonString(new JsonSerializerOptions { WriteIndented = false }));
+            });
+
+            json.AddMethod("set", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+                JsValue val = (a.Length > 1) ? a[1] : JsValue.Null();
+                bool parseJson = (a.Length > 2 && a[2].Type == Kind.Number && (int)a[2].Number != 0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+
+                var node = JsToJsonNode(val, parseJson, out var verr);
+                if (verr.Length > 0)
+                {
+                    obj.Set("error", JsValue.FromString(verr));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!GetParent(st, segs, create: true, out var parent, out var last, out var rerr))
+                {
+                    obj.Set("error", JsValue.FromString(rerr));
+                    return JsValue.FromNumber(0);
+                }
+                if (parent == null)
+                {
+                    obj.Set("error", JsValue.FromString("Parent missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) { obj.Set("error", JsValue.FromString("Target is not an object.")); return JsValue.FromNumber(0); }
+                        jo[key] = node;
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) { obj.Set("error", JsValue.FromString("Target is not an array.")); return JsValue.FromNumber(0); }
+                        while (ja.Count <= idx) ja.Add(null);
+                        ja[idx] = node;
+                    }
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            json.AddMethod("setJson", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero)
+                    return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    // setJson(text)  -> whole document
+                    if (a.Length == 1)
+                    {
+                        string text = (a[0].Type == Kind.String) ? (a[0].String ?? "") : (a[0].String ?? "");
+                        st.Root = JsonNode.Parse(text) ?? new JsonObject();
+                        return JsValue.FromNumber(1);
+                    }
+
+                    // setJson(path, fragmentJson) -> set at path, fragment is parsed as JSON
+                    if (a.Length >= 2)
+                    {
+                        string path = (a[0].Type == Kind.String) ? (a[0].String ?? "") : "";
+                        string frag = (a[1].Type == Kind.String) ? (a[1].String ?? "") : (a[1].String ?? "");
+
+                        if (!TryParsePath(path, out var segs, out var perr))
+                        {
+                            obj.Set("error", JsValue.FromString(perr));
+                            return JsValue.FromNumber(0);
+                        }
+
+                        JsonNode? node;
+                        try
+                        {
+                            node = JsonNode.Parse(frag);
+                        }
+                        catch (Exception ex2)
+                        {
+                            obj.Set("error", JsValue.FromString(ex2.Message));
+                            return JsValue.FromNumber(0);
+                        }
+
+                        if (!GetParent(st, segs, create: true, out var parent, out var last, out var rerr))
+                        {
+                            obj.Set("error", JsValue.FromString(rerr));
+                            return JsValue.FromNumber(0);
+                        }
+                        if (parent == null)
+                        {
+                            obj.Set("error", JsValue.FromString("Parent missing."));
+                            return JsValue.FromNumber(0);
+                        }
+
+                        if (last is string key)
+                        {
+                            if (parent is not JsonObject jo)
+                            {
+                                obj.Set("error", JsValue.FromString("Target is not an object."));
+                                return JsValue.FromNumber(0);
+                            }
+                            jo[key] = node;
+                        }
+                        else
+                        {
+                            int idx = (int)last;
+                            if (parent is not JsonArray ja)
+                            {
+                                obj.Set("error", JsValue.FromString("Target is not an array."));
+                                return JsValue.FromNumber(0);
+                            }
+                            while (ja.Count <= idx) ja.Add(null);
+                            ja[idx] = node;
+                        }
+
+                        return JsValue.FromNumber(1);
+                    }
+
+                    obj.Set("error", JsValue.FromString("setJson expects 1 or 2 arguments."));
+                    return JsValue.FromNumber(0);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            json.AddMethod("exists", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                if (!TryParsePath(path, out var segs, out _)) return JsValue.FromNumber(0);
+                return JsValue.FromNumber(GetNode(st.Root, segs) != null ? 1 : 0);
+            });
+
+            json.AddMethod("type", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.Null();
+
+                if (!TryParsePath(path, out var segs, out _)) return JsValue.Null();
+                var n = GetNode(st.Root, segs);
+                if (n == null) return JsValue.FromString("null");
+                if (n is JsonArray) return JsValue.FromString("array");
+                if (n is JsonObject) return JsValue.FromString("object");
+                if (n is JsonValue jv)
+                {
+                    if (jv.TryGetValue<string>(out _)) return JsValue.FromString("string");
+                    if (jv.TryGetValue<bool>(out _)) return JsValue.FromString("bool");
+                    return JsValue.FromString("number");
+                }
+                return JsValue.FromString("unknown");
+            });
+
+            json.AddMethod("length", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                if (!TryParsePath(path, out var segs, out _)) return JsValue.FromNumber(0);
+                var n = GetNode(st.Root, segs);
+
+                if (n is JsonArray ja) return JsValue.FromNumber(ja.Count);
+                if (n is JsonObject jo) return JsValue.FromNumber(jo.Count);
+                if (n is JsonValue jv && jv.TryGetValue<string>(out var s)) return JsValue.FromNumber((s ?? "").Length);
+                return JsValue.FromNumber(0);
+            });
+
+            json.AddMethod("keys", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st)) return JsValue.Null();
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.Null();
+                }
+
+                var n = GetNode(st.Root, segs);
+                if (n is not JsonObject jo) return JsValue.Null();
+
+                var arr = new JsonArray();
+                foreach (var kv in jo) arr.Add(kv.Key);
+                return JsValue.FromString(arr.ToJsonString());
+            });
+
+            json.AddMethod("remove", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (segs.Count == 0) return JsValue.FromNumber(0);
+
+                if (!GetParent(st, segs, create: false, out var parent, out var last, out var rerr))
+                {
+                    obj.Set("error", JsValue.FromString(rerr));
+                    return JsValue.FromNumber(0);
+                }
+                if (parent == null) return JsValue.FromNumber(0);
+
+                try
+                {
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) return JsValue.FromNumber(0);
+                        return JsValue.FromNumber(jo.Remove(key) ? 1 : 0);
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) return JsValue.FromNumber(0);
+                        if (idx < 0 || idx >= ja.Count) return JsValue.FromNumber(0);
+                        ja.RemoveAt(idx);
+                        return JsValue.FromNumber(1);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            json.AddMethod("push", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                string path = (a.Length > 0) ? (a[0].String ?? "") : "";
+                JsValue val = (a.Length > 1) ? a[1] : JsValue.Null();
+                bool parseJson = (a.Length > 2 && a[2].Type == Kind.Number && (int)a[2].Number != 0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_json.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("JSON state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (!TryParsePath(path, out var segs, out var perr))
+                {
+                    obj.Set("error", JsValue.FromString(perr));
+                    return JsValue.FromNumber(0);
+                }
+
+                var node = JsToJsonNode(val, parseJson, out var verr);
+                if (verr.Length > 0)
+                {
+                    obj.Set("error", JsValue.FromString(verr));
+                    return JsValue.FromNumber(0);
+                }
+
+                // ensure target exists as array
+                var target = GetNode(st.Root, segs);
+                if (target == null)
+                {
+                    // create container at path
+                    if (!GetParent(st, segs, create: true, out var parent, out var last, out var rerr))
+                    {
+                        obj.Set("error", JsValue.FromString(rerr));
+                        return JsValue.FromNumber(0);
+                    }
+                    if (parent == null)
+                    {
+                        obj.Set("error", JsValue.FromString("Parent missing."));
+                        return JsValue.FromNumber(0);
+                    }
+
+                    var newArr = new JsonArray();
+                    if (last is string key)
+                    {
+                        if (parent is not JsonObject jo) { obj.Set("error", JsValue.FromString("Target is not an object.")); return JsValue.FromNumber(0); }
+                        jo[key] = newArr;
+                    }
+                    else
+                    {
+                        int idx = (int)last;
+                        if (parent is not JsonArray ja) { obj.Set("error", JsValue.FromString("Target is not an array.")); return JsValue.FromNumber(0); }
+                        while (ja.Count <= idx) ja.Add(null);
+                        ja[idx] = newArr;
+                    }
+
+                    target = newArr;
+                }
+
+                if (target is not JsonArray arr)
+                {
+                    obj.Set("error", JsValue.FromString("Target is not an array."));
+                    return JsValue.FromNumber(0);
+                }
+
+                arr.Add(node);
+                return JsValue.FromNumber(arr.Count);
+            });
+
+            json.AddMethod("free", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                return JsValue.FromNumber((id >= 0 && _json.Remove(id)) ? 1 : 0);
+            });
+
+            json.DeclareToGlobals();
+        }
+
+
+        using (JsClass http = _js.CreateClass("HTTPRequest"))
+        {
+            // Encoding Resolver (wie bei File, aber wiederverwendbar hier)
+            Func<string?, Encoding> ResolveEncoding = (encRaw) =>
+            {
+                string e = (encRaw ?? "utf-8").Trim().ToLowerInvariant();
+                return e switch
+                {
+                    "utf-8" or "utf8" or "utf-8-nobom" or "utf8-nobom" => new UTF8Encoding(false),
+                    "utf-8-bom" or "utf8-bom" => new UTF8Encoding(true),
+
+                    "utf-16" or "utf16" or "utf-16le" or "utf16le" or "unicode" => new UnicodeEncoding(false, false),
+                    "utf-16-bom" or "utf16-bom" or "utf-16le-bom" or "utf16le-bom" or "unicode-bom" => new UnicodeEncoding(false, true),
+
+                    "utf-16be" or "utf16be" => new UnicodeEncoding(true, false),
+                    "utf-16be-bom" or "utf16be-bom" => new UnicodeEncoding(true, true),
+
+                    "utf-32" or "utf32" or "utf-32le" or "utf32le" => new UTF32Encoding(false, false),
+                    "utf-32-bom" or "utf32-bom" or "utf-32le-bom" or "utf32le-bom" => new UTF32Encoding(false, true),
+
+                    "utf-32be" or "utf32be" => new UTF32Encoding(true, false),
+                    "utf-32be-bom" or "utf32be-bom" => new UTF32Encoding(true, true),
+
+                    _ => Encoding.GetEncoding(encRaw ?? "utf-8")
+                };
+            };
+
+            // Request-Headers aus:
+            //  - string (Header-Zeilen)
+            //  - oder object (wenn JsObject Keys-API vorhanden -> per Reflection probieren)
+            Action<JsObject, HttpRequestMessage, HttpContent?> ApplyHeaders = (obj, req, content) =>
+            {
+                JsValue hv = obj.Get("Headers");
+
+                // 1) Headers als String: "A: b\nC: d"
+                if (hv.Type == Kind.String)
+                {
+                    string raw = hv.String ?? "";
+                    var lines = raw.Replace("\r", "").Split('\n', StringSplitOptions.RemoveEmptyEntries);
+                    foreach (var line in lines)
+                    {
+                        int p = line.IndexOf(':');
+                        if (p <= 0) continue;
+                        string name = line.Substring(0, p).Trim();
+                        string val = line.Substring(p + 1).Trim();
+                        if (name.Length == 0) continue;
+
+                        if (!req.Headers.TryAddWithoutValidation(name, val))
+                            content?.Headers.TryAddWithoutValidation(name, val);
+                    }
+                    return;
+                }
+
+                // 2) Headers als JS Object: { "User-Agent":"...", "Accept":"..." }
+                if (hv.Type == Kind.Object && hv.Handle != IntPtr.Zero)
+                {
+                    _js.RetainHandle(hv.Handle);
+                    using var hobj = new JsObject(_js, hv.Handle, true);
+
+                    // versuch Keys() / GetKeys() / PropertyNames() etc.
+                    IEnumerable<string> keys = Array.Empty<string>();
+
+                    var t = hobj.GetType();
+                    var m =
+                        t.GetMethod("Keys", BindingFlags.Public | BindingFlags.Instance)
+                        ?? t.GetMethod("GetKeys", BindingFlags.Public | BindingFlags.Instance)
+                        ?? t.GetMethod("GetPropertyNames", BindingFlags.Public | BindingFlags.Instance)
+                        ?? t.GetMethod("PropertyNames", BindingFlags.Public | BindingFlags.Instance);
+
+                    if (m != null)
+                    {
+                        object? r = m.Invoke(hobj, null);
+                        if (r is string[] sa) keys = sa;
+                        else if (r is IEnumerable<string> es) keys = es;
+                        else if (r is IEnumerable<object> eo) keys = eo.Select(x => x?.ToString() ?? "");
+                    }
+
+                    foreach (var k in keys)
+                    {
+                        if (string.IsNullOrWhiteSpace(k)) continue;
+                        JsValue vv = hobj.Get(k);
+                        string val = vv.String ?? "";
+                        if (!req.Headers.TryAddWithoutValidation(k, val))
+                            content?.Headers.TryAddWithoutValidation(k, val);
+                    }
+                }
+            };
+
+            Func<HttpResponseMessage, string> BuildHeaderString = (resp) =>
+            {
+                var sb = new StringBuilder();
+
+                foreach (var h in resp.Headers)
+                    sb.Append(h.Key).Append(": ").Append(string.Join(", ", h.Value)).Append('\n');
+
+                foreach (var h in resp.Content.Headers)
+                    sb.Append(h.Key).Append(": ").Append(string.Join(", ", h.Value)).Append('\n');
+
+                return sb.ToString();
+            };
+
+            Func<string, bool> IsTextContentType = (ct) =>
+            {
+                string x = (ct ?? "").ToLowerInvariant();
+                return x.StartsWith("text/")
+                    || x.Contains("json")
+                    || x.Contains("xml")
+                    || x.Contains("html")
+                    || x.Contains("javascript");
+            };
+
+            http.AddMethod("constructor", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                int id = _httpNextId++;
+                _http[id] = new HttpState();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("_id", JsValue.FromNumber(id));
+                obj.Set("error", JsValue.Null());
+
+                obj.Set("Method", JsValue.FromString("GET"));
+                obj.Set("Url", JsValue.FromString(""));
+                obj.Set("ContentType", JsValue.FromString(""));
+
+                // kann string oder object sein
+                obj.Set("Headers", JsValue.FromString(""));
+
+                // Body ist string (Text) oder Base64 wenn Binary=1
+                obj.Set("Body", JsValue.FromString(""));
+
+                obj.Set("Encoding", JsValue.FromString("utf-8"));
+                obj.Set("Binary", JsValue.FromNumber(0));       // 1 => Body ist Base64 / Response Base64
+                obj.Set("TimeoutMs", JsValue.FromNumber(30000)); // default 30s
+
+                // Upload-“Streaming”: openstream() macht Buffer, writestream() füllt, closestream() sendet
+                obj.Set("StreamUpload", JsValue.FromNumber(0)); // 1 => Upload-Buffer aktiv
+
+                // Response Infos
+                obj.Set("Status", JsValue.FromNumber(0));
+                obj.Set("StatusText", JsValue.FromString(""));
+                obj.Set("ResponseContentType", JsValue.FromString(""));
+                obj.Set("ResponseHeaders", JsValue.FromString(""));
+                obj.Set("ResponseBase64", JsValue.FromString(""));
+                obj.Set("ResponseText", JsValue.FromString(""));
+
+                return JsValue.Null();
+            });
+
+            // Send() => string (Text oder Base64, je nach Binary/ContentType)
+            http.AddMethod("Send", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_http.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTTP state missing."));
+                    return JsValue.Null();
+                }
+
+                string url = obj.Get("Url").String ?? "";
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    obj.Set("error", JsValue.FromString("Url is empty."));
+                    return JsValue.Null();
+                }
+
+                string m = (obj.Get("Method").String ?? "GET").Trim();
+                if (m.Length == 0) m = "GET";
+
+                string ct = obj.Get("ContentType").String ?? "";
+                string body = obj.Get("Body").String ?? "";
+
+                int timeoutMs = (obj.Get("TimeoutMs").Type == Kind.Number) ? (int)obj.Get("TimeoutMs").Number : 30000;
+                if (timeoutMs <= 0) timeoutMs = 30000;
+
+                bool reqBinary = (obj.Get("Binary").Type == Kind.Number) && ((int)obj.Get("Binary").Number != 0);
+                Encoding enc = ResolveEncoding(obj.Get("Encoding").String);
+
+                try
+                {
+                    using var cts = new CancellationTokenSource(timeoutMs);
+
+                    var req = new HttpRequestMessage(new HttpMethod(m.ToUpperInvariant()), url);
+
+                    HttpContent? content = null;
+
+                    // Body nur wenn da ist ODER Method typisch Body hat
+                    bool wantsBody = body.Length > 0 && !string.Equals(m, "GET", StringComparison.OrdinalIgnoreCase)
+                                               && !string.Equals(m, "HEAD", StringComparison.OrdinalIgnoreCase);
+
+                    if (wantsBody)
+                    {
+                        byte[] data = reqBinary ? Convert.FromBase64String(body) : enc.GetBytes(body);
+                        content = new ByteArrayContent(data);
+
+                        string useCt = ct;
+                        if (string.IsNullOrWhiteSpace(useCt))
+                            useCt = reqBinary ? "application/octet-stream" : "text/plain; charset=" + enc.WebName;
+
+                        content.Headers.TryAddWithoutValidation("Content-Type", useCt);
+                        req.Content = content;
+                    }
+
+                    ApplyHeaders(obj, req, content);
+
+                    using var resp = _httpClient.SendAsync(req, HttpCompletionOption.ResponseContentRead, cts.Token)
+                                               .GetAwaiter().GetResult();
+
+                    obj.Set("Status", JsValue.FromNumber((int)resp.StatusCode));
+                    obj.Set("StatusText", JsValue.FromString(resp.ReasonPhrase ?? ""));
+                    obj.Set("ResponseHeaders", JsValue.FromString(BuildHeaderString(resp)));
+
+                    string respCt = resp.Content.Headers.ContentType?.ToString() ?? "";
+                    obj.Set("ResponseContentType", JsValue.FromString(respCt));
+
+                    byte[] rb = resp.Content.ReadAsByteArrayAsync(cts.Token).GetAwaiter().GetResult();
+
+                    bool isText = !reqBinary && IsTextContentType(respCt);
+
+                    if (!isText)
+                    {
+                        string b64 = Convert.ToBase64String(rb);
+                        obj.Set("ResponseBase64", JsValue.FromString(b64));
+                        obj.Set("ResponseText", JsValue.FromString(""));
+                        return JsValue.FromString(b64);
+                    }
+                    else
+                    {
+                        // charset aus response wenn vorhanden, sonst Request-Encoding
+                        Encoding respEnc = enc;
+                        string? cs = resp.Content.Headers.ContentType?.CharSet;
+                        if (!string.IsNullOrWhiteSpace(cs))
+                        {
+                            try { respEnc = Encoding.GetEncoding(cs); } catch { /* fallback */ }
+                        }
+
+                        string txt = respEnc.GetString(rb);
+                        obj.Set("ResponseText", JsValue.FromString(txt));
+                        obj.Set("ResponseBase64", JsValue.FromString(""));
+                        return JsValue.FromString(txt);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            // send() alias
+            http.AddMethod("send", (JsValue[] a, JsValue thisVal) =>
+            {
+                // einfach Send() nochmal aufrufen via Copy-Paste wäre deppert;
+                // wir machen direkt dasselbe wie Send, aber minimal:
+                // -> call Send by using the same handler name in JS: "Send"
+                // MiniJsHost hat keinen direkten "invoke other method", daher: duplicate mit minimal overhead
+                // (Wenn dich das stört: lösch alias und nutz nur Send())
+                return JsValue.Null();
+            });
+
+            // openstream()
+            // - wenn StreamUpload=1: öffnet Upload-Buffer (writestream -> buffer)
+            // - sonst: sendet request und öffnet Response-Stream zum readstream()
+            http.AddMethod("openstream", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_http.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTTP state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                // schon offen?
+                if (st.RespStream != null || st.Upload != null)
+                {
+                    obj.Set("error", JsValue.FromString("Stream already open."));
+                    return JsValue.FromNumber(0);
+                }
+
+                bool streamUpload = (obj.Get("StreamUpload").Type == Kind.Number) && ((int)obj.Get("StreamUpload").Number != 0);
+                bool binary = (obj.Get("Binary").Type == Kind.Number) && ((int)obj.Get("Binary").Number != 0);
+                Encoding enc = ResolveEncoding(obj.Get("Encoding").String);
+
+                if (streamUpload)
+                {
+                    st.Upload = new MemoryStream();
+                    st.UploadEnc = enc;
+                    st.UploadBinary = binary;
+                    return JsValue.FromNumber(1);
+                }
+
+                string url = obj.Get("Url").String ?? "";
+                if (string.IsNullOrWhiteSpace(url))
+                {
+                    obj.Set("error", JsValue.FromString("Url is empty."));
+                    return JsValue.FromNumber(0);
+                }
+
+                string m = (obj.Get("Method").String ?? "GET").Trim();
+                if (m.Length == 0) m = "GET";
+
+                string ct = obj.Get("ContentType").String ?? "";
+                string body = obj.Get("Body").String ?? "";
+
+                int timeoutMs = (obj.Get("TimeoutMs").Type == Kind.Number) ? (int)obj.Get("TimeoutMs").Number : 30000;
+                if (timeoutMs <= 0) timeoutMs = 30000;
+
+                try
+                {
+                    using var cts = new CancellationTokenSource(timeoutMs);
+
+                    var req = new HttpRequestMessage(new HttpMethod(m.ToUpperInvariant()), url);
+
+                    HttpContent? content = null;
+                    bool wantsBody = body.Length > 0 && !string.Equals(m, "GET", StringComparison.OrdinalIgnoreCase)
+                                               && !string.Equals(m, "HEAD", StringComparison.OrdinalIgnoreCase);
+
+                    if (wantsBody)
+                    {
+                        byte[] data = binary ? Convert.FromBase64String(body) : enc.GetBytes(body);
+                        content = new ByteArrayContent(data);
+
+                        string useCt = ct;
+                        if (string.IsNullOrWhiteSpace(useCt))
+                            useCt = binary ? "application/octet-stream" : "text/plain; charset=" + enc.WebName;
+
+                        content.Headers.TryAddWithoutValidation("Content-Type", useCt);
+                        req.Content = content;
+                    }
+
+                    ApplyHeaders(obj, req, content);
+
+                    // ResponseHeadersRead => streambar
+                    var resp = _httpClient.SendAsync(req, HttpCompletionOption.ResponseHeadersRead, cts.Token)
+                                         .GetAwaiter().GetResult();
+
+                    st.Resp = resp;
+                    //st.RespStream = resp.Content.ReadAsStream(cts.Token).GetAwaiter().GetResult();
+                    st.RespStream = resp.Content.ReadAsStreamAsync(cts.Token).GetAwaiter().GetResult();
+
+
+                    obj.Set("Status", JsValue.FromNumber((int)resp.StatusCode));
+                    obj.Set("StatusText", JsValue.FromString(resp.ReasonPhrase ?? ""));
+                    obj.Set("ResponseHeaders", JsValue.FromString(BuildHeaderString(resp)));
+
+                    string respCt = resp.Content.Headers.ContentType?.ToString() ?? "";
+                    obj.Set("ResponseContentType", JsValue.FromString(respCt));
+
+                    bool isText = !binary && IsTextContentType(respCt);
+                    st.StreamBinary = !isText;
+
+                    if (!st.StreamBinary)
+                    {
+                        Encoding respEnc = enc;
+                        string? cs = resp.Content.Headers.ContentType?.CharSet;
+                        if (!string.IsNullOrWhiteSpace(cs))
+                        {
+                            try { respEnc = Encoding.GetEncoding(cs); } catch { }
+                        }
+
+                        st.RespReader = new StreamReader(st.RespStream, respEnc, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true);
+                    }
+
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            // readstream([n]) -> chunk (string) oder Base64 (wenn binary) oder null bei EOF
+            http.AddMethod("readstream", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_http.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTTP state missing."));
+                    return JsValue.Null();
+                }
+
+                int n = 4096;
+                if (a.Length > 0 && a[0].Type == Kind.Number)
+                {
+                    n = (int)a[0].Number;
+                    if (n <= 0) n = 4096;
+                    if (n > 1024 * 1024) n = 1024 * 1024;
+                }
+
+                try
+                {
+                    if (st.RespStream == null)
+                    {
+                        obj.Set("error", JsValue.FromString("No open response stream."));
+                        return JsValue.Null();
+                    }
+
+                    if (st.StreamBinary)
+                    {
+                        byte[] buf = new byte[n];
+                        int r = st.RespStream.Read(buf, 0, buf.Length);
+                        if (r <= 0) return JsValue.Null();
+                        if (r != buf.Length) Array.Resize(ref buf, r);
+                        return JsValue.FromString(Convert.ToBase64String(buf));
+                    }
+                    else
+                    {
+                        if (st.RespReader == null)
+                        {
+                            obj.Set("error", JsValue.FromString("Text reader not initialized."));
+                            return JsValue.Null();
+                        }
+
+                        char[] cb = new char[n];
+                        int r = st.RespReader.Read(cb, 0, cb.Length);
+                        if (r <= 0) return JsValue.Null();
+                        return JsValue.FromString(new string(cb, 0, r));
+                    }
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            // writestream(data) -> 1/0  (nur wenn StreamUpload=1 und openstream() gemacht)
+            // - wenn Binary=1: data ist Base64
+            // - sonst: data ist Text (Encoding property)
+            http.AddMethod("writestream", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_http.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTTP state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (st.Upload == null)
+                {
+                    obj.Set("error", JsValue.FromString("No open upload stream. Set StreamUpload=1 and call openstream() first."));
+                    return JsValue.FromNumber(0);
+                }
+
+                if (a.Length < 1)
+                {
+                    obj.Set("error", JsValue.FromString("Missing data."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    string s = a[0].String ?? "";
+
+                    if (st.UploadBinary)
+                    {
+                        byte[] data = Convert.FromBase64String(s);
+                        st.Upload.Write(data, 0, data.Length);
+                    }
+                    else
+                    {
+                        byte[] data = st.UploadEnc.GetBytes(s);
+                        st.Upload.Write(data, 0, data.Length);
+                    }
+
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            // closestream()
+            // - wenn Upload offen: sendet request mit Buffer und gibt Response (Text/Base64) zurück
+            // - wenn Response-Stream offen: schließt und gibt 1 zurück
+            http.AddMethod("closestream", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_http.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTTP state missing."));
+                    return JsValue.Null();
+                }
+
+                // 1) Upload-Mode => jetzt senden + response komplett lesen
+                if (st.Upload != null)
+                {
+                    string url = obj.Get("Url").String ?? "";
+                    if (string.IsNullOrWhiteSpace(url))
+                    {
+                        obj.Set("error", JsValue.FromString("Url is empty."));
+                        st.Upload.Dispose();
+                        st.Upload = null;
+                        return JsValue.Null();
+                    }
+
+                    string m = (obj.Get("Method").String ?? "POST").Trim();
+                    if (m.Length == 0) m = "POST";
+
+                    string ct = obj.Get("ContentType").String ?? "";
+                    int timeoutMs = (obj.Get("TimeoutMs").Type == Kind.Number) ? (int)obj.Get("TimeoutMs").Number : 30000;
+                    if (timeoutMs <= 0) timeoutMs = 30000;
+
+                    bool reqBinary = (obj.Get("Binary").Type == Kind.Number) && ((int)obj.Get("Binary").Number != 0);
+                    Encoding enc = ResolveEncoding(obj.Get("Encoding").String);
+
+                    try
+                    {
+                        using var cts = new CancellationTokenSource(timeoutMs);
+
+                        byte[] payload = st.Upload.ToArray();
+                        st.Upload.Dispose();
+                        st.Upload = null;
+
+                        var req = new HttpRequestMessage(new HttpMethod(m.ToUpperInvariant()), url);
+                        var content = new ByteArrayContent(payload);
+
+                        string useCt = ct;
+                        if (string.IsNullOrWhiteSpace(useCt))
+                            useCt = reqBinary ? "application/octet-stream" : "text/plain; charset=" + enc.WebName;
+
+                        content.Headers.TryAddWithoutValidation("Content-Type", useCt);
+                        req.Content = content;
+
+                        ApplyHeaders(obj, req, content);
+
+                        using var resp = _httpClient.SendAsync(req, HttpCompletionOption.ResponseContentRead, cts.Token)
+                                                   .GetAwaiter().GetResult();
+
+                        obj.Set("Status", JsValue.FromNumber((int)resp.StatusCode));
+                        obj.Set("StatusText", JsValue.FromString(resp.ReasonPhrase ?? ""));
+                        obj.Set("ResponseHeaders", JsValue.FromString(BuildHeaderString(resp)));
+
+                        string respCt = resp.Content.Headers.ContentType?.ToString() ?? "";
+                        obj.Set("ResponseContentType", JsValue.FromString(respCt));
+
+                        byte[] rb = resp.Content.ReadAsByteArrayAsync(cts.Token).GetAwaiter().GetResult();
+
+                        bool isText = !reqBinary && IsTextContentType(respCt);
+
+                        if (!isText)
+                        {
+                            string b64 = Convert.ToBase64String(rb);
+                            obj.Set("ResponseBase64", JsValue.FromString(b64));
+                            obj.Set("ResponseText", JsValue.FromString(""));
+                            return JsValue.FromString(b64);
+                        }
+                        else
+                        {
+                            Encoding respEnc = enc;
+                            string? cs = resp.Content.Headers.ContentType?.CharSet;
+                            if (!string.IsNullOrWhiteSpace(cs))
+                            {
+                                try { respEnc = Encoding.GetEncoding(cs); } catch { }
+                            }
+
+                            string txt = respEnc.GetString(rb);
+                            obj.Set("ResponseText", JsValue.FromString(txt));
+                            obj.Set("ResponseBase64", JsValue.FromString(""));
+                            return JsValue.FromString(txt);
+                        }
+                    }
+                    catch (Exception ex)
+                    {
+                        obj.Set("error", JsValue.FromString(ex.Message));
+                        return JsValue.Null();
+                    }
+                }
+
+                // 2) Response-Stream Mode => schließen
+                try
+                {
+                    st.RespReader?.Dispose();
+                    st.RespReader = null;
+
+                    st.RespStream?.Dispose();
+                    st.RespStream = null;
+
+                    st.Resp?.Dispose();
+                    st.Resp = null;
+
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            // optional: free()
+            http.AddMethod("free", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0) return JsValue.FromNumber(0);
+
+                if (_http.TryGetValue(id, out var st))
+                {
+                    try
+                    {
+                        st.RespReader?.Dispose();
+                        st.RespStream?.Dispose();
+                        st.Resp?.Dispose();
+                        st.Upload?.Dispose();
+                    }
+                    catch { }
+                }
+
+                return JsValue.FromNumber(_http.Remove(id) ? 1 : 0);
+            });
+
+            http.DeclareToGlobals();
+
+        }
+
 
         string code = File.ReadAllText(args[0]);
 
