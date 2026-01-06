@@ -887,6 +887,74 @@ internal static class Program
 
     #endregion
 
+    #region PROCESS Helpers
+
+    private static int _procNextId = 1;
+
+    private sealed class ProcState : IDisposable
+    {
+        public System.Diagnostics.Process P = null!;
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Out = new();
+        public readonly System.Collections.Concurrent.ConcurrentQueue<string> Err = new();
+        public volatile int ExitCode = -1;
+        public volatile int HasExited = 0;
+        public int MergeErr = 0;
+        public readonly CancellationTokenSource Cts = new();
+
+        public void Dispose()
+        {
+            try { Cts.Cancel(); } catch { }
+
+            try { P?.StandardInput?.Close(); } catch { }
+            try { if (P != null && !P.HasExited) P.Kill(entireProcessTree: true); } catch { }
+
+            try { P?.Dispose(); } catch { }
+            try { Cts.Dispose(); } catch { }
+        }
+    }
+
+    private static readonly System.Collections.Concurrent.ConcurrentDictionary<int, ProcState> _procs = new();
+
+    private static string DequeueAll(System.Collections.Concurrent.ConcurrentQueue<string> q)
+    {
+        if (q.IsEmpty) return "";
+        var sb = new System.Text.StringBuilder();
+        while (q.TryDequeue(out var s)) sb.Append(s);
+        return sb.ToString();
+    }
+
+    private static System.Text.Encoding GetOemEncodingFallback()
+    {
+        try
+        {
+            // ping & Co schreiben oft OEM Codepage -> sonst kommt "ausgefuehrt"
+            int oem = System.Globalization.CultureInfo.CurrentCulture.TextInfo.OEMCodePage;
+            return System.Text.Encoding.GetEncoding(oem);
+        }
+        catch
+        {
+            return new System.Text.UTF8Encoding(false);
+        }
+    }
+
+    private static async Task PumpAsync(System.IO.TextReader reader,
+        System.Collections.Concurrent.ConcurrentQueue<string> q,
+        System.Threading.CancellationToken ct)
+    {
+        char[] buf = new char[4096];
+        while (!ct.IsCancellationRequested)
+        {
+            int n;
+            try { n = await reader.ReadAsync(buf, 0, buf.Length).ConfigureAwait(false); }
+            catch { break; }
+
+            if (n <= 0) break;
+            q.Enqueue(new string(buf, 0, n));
+        }
+    }
+
+    #endregion
+
     public static int Main(string[] args)
     {
 
@@ -4222,6 +4290,282 @@ internal static class Program
             });
 
             yaml.DeclareToGlobals();
+        }
+
+        using (JsClass proc = _js.CreateClass("Process"))
+        {
+            proc.AddMethod("constructor", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                o.Set("FileName", JsValue.FromString(""));
+                o.Set("Arguments", JsValue.FromString(""));
+                o.Set("WorkingDir", JsValue.FromString(""));
+                o.Set("MergeErr", JsValue.FromNumber(0));
+                o.Set("error", JsValue.Null());
+
+                o.Set("_id", JsValue.FromNumber(0));
+                o.Set("Pid", JsValue.FromNumber(0));
+
+                return JsValue.Null();
+            });
+
+            proc.AddMethod("start", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+                o.Set("error", JsValue.Null());
+
+                // falls schon mal gestartet -> freigeben
+                int oldId = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (oldId > 0 && _procs.TryRemove(oldId, out var old))
+                {
+                    try { old.Dispose(); } catch { }
+                }
+                o.Set("_id", JsValue.FromNumber(0));
+                o.Set("Pid", JsValue.FromNumber(0));
+
+                string file = o.Get("FileName").String ?? "";
+                string args = o.Get("Arguments").String ?? "";
+                string wd = o.Get("WorkingDir").String ?? "";
+                int mergeErr = (o.Get("MergeErr").Type == Kind.Number) ? (int)o.Get("MergeErr").Number : 0;
+
+                if (string.IsNullOrWhiteSpace(file))
+                {
+                    o.Set("error", JsValue.FromString("FileName is empty."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var enc = GetOemEncodingFallback();
+
+                    var psi = new System.Diagnostics.ProcessStartInfo
+                    {
+                        FileName = file,
+                        Arguments = args,
+                        WorkingDirectory = string.IsNullOrWhiteSpace(wd) ? Environment.CurrentDirectory : wd,
+
+                        UseShellExecute = false,
+                        RedirectStandardOutput = true,
+                        RedirectStandardError = true,
+                        RedirectStandardInput = true,
+
+                        CreateNoWindow = true,
+                        StandardOutputEncoding = enc,
+                        StandardErrorEncoding = enc
+                    };
+
+                    var p = new System.Diagnostics.Process
+                    {
+                        StartInfo = psi,
+                        EnableRaisingEvents = true
+                    };
+
+                    int id = System.Threading.Interlocked.Increment(ref _procNextId);
+
+                    var st = new ProcState
+                    {
+                        P = p,
+                        MergeErr = mergeErr != 0 ? 1 : 0
+                    };
+
+                    p.Exited += (_, __) =>
+                    {
+                        try { st.ExitCode = p.ExitCode; } catch { }
+                        st.HasExited = 1;
+                    };
+
+                    if (!p.Start())
+                    {
+                        st.Dispose();
+                        o.Set("error", JsValue.FromString("Process.Start() returned false."));
+                        return JsValue.FromNumber(0);
+                    }
+
+                    // stdout/stderr pumpen (non-blocking für JS)
+                    _ = Task.Run(() => PumpAsync(p.StandardOutput, st.Out, st.Cts.Token));
+
+                    if (st.MergeErr == 1)
+                        _ = Task.Run(() => PumpAsync(p.StandardError, st.Out, st.Cts.Token));
+                    else
+                        _ = Task.Run(() => PumpAsync(p.StandardError, st.Err, st.Cts.Token));
+
+                    _procs[id] = st;
+
+                    o.Set("_id", JsValue.FromNumber(id));
+                    o.Set("Pid", JsValue.FromNumber(p.Id));
+
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    o.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            proc.AddMethod("isRunning", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st) || st.P == null) return JsValue.FromNumber(0);
+
+                try
+                {
+                    if (st.P.HasExited)
+                    {
+                        st.HasExited = 1;
+                        try { st.ExitCode = st.P.ExitCode; } catch { }
+                        return JsValue.FromNumber(0);
+                    }
+                    return JsValue.FromNumber(1);
+                }
+                catch
+                {
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            // NON-BLOCKING: gibt "" zurück wenn grad nix da ist
+            proc.AddMethod("read", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromString("");
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st)) return JsValue.FromString("");
+
+                return JsValue.FromString(DequeueAll(st.Out));
+            });
+
+            proc.AddMethod("readErr", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromString("");
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st)) return JsValue.FromString("");
+
+                return JsValue.FromString(DequeueAll(st.Err));
+            });
+
+            proc.AddMethod("write", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+                o.Set("error", JsValue.Null());
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st))
+                {
+                    o.Set("error", JsValue.FromString("Process not started."));
+                    return JsValue.FromNumber(0);
+                }
+
+                string s = (a.Length > 0) ? (a[0].String ?? "") : "";
+                try
+                {
+                    st.P.StandardInput.Write(s);
+                    st.P.StandardInput.Flush();
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    o.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            proc.AddMethod("closeInput", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                try { st.P.StandardInput.Close(); return JsValue.FromNumber(1); }
+                catch { return JsValue.FromNumber(0); }
+            });
+
+            proc.AddMethod("exitCode", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(-1);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st)) return JsValue.FromNumber(-1);
+
+                try
+                {
+                    if (st.P.HasExited)
+                    {
+                        st.HasExited = 1;
+                        try { st.ExitCode = st.P.ExitCode; } catch { }
+                        return JsValue.FromNumber(st.ExitCode);
+                    }
+                }
+                catch { }
+
+                return JsValue.FromNumber(-1);
+            });
+
+            proc.AddMethod("kill", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0 || !_procs.TryGetValue(id, out var st)) return JsValue.FromNumber(0);
+
+                try { st.P.Kill(entireProcessTree: true); return JsValue.FromNumber(1); }
+                catch { return JsValue.FromNumber(0); }
+            });
+
+            proc.AddMethod("free", (a, thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var o = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (o.Get("_id").Type == Kind.Number) ? (int)o.Get("_id").Number : 0;
+                if (id <= 0) return JsValue.FromNumber(0);
+
+                o.Set("_id", JsValue.FromNumber(0));
+                o.Set("Pid", JsValue.FromNumber(0));
+
+                if (_procs.TryRemove(id, out var st))
+                {
+                    try { st.Dispose(); } catch { }
+                    return JsValue.FromNumber(1);
+                }
+                return JsValue.FromNumber(0);
+            });
+
+            proc.DeclareToGlobals();
         }
 
         #endregion
