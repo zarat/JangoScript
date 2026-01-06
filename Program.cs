@@ -223,6 +223,63 @@ internal static class Program
 
     #endregion
 
+    #region HTML Helpers
+
+    private static int _htmlNextId = 1;
+
+    private sealed class HtmlState
+    {
+        public HtmlDocument Doc = new HtmlDocument();
+        public string Html = "";
+    }
+
+    private static readonly Dictionary<int, HtmlState> _html = new();
+
+    private static void HtmlLoad(HtmlState st, string html)
+    {
+        st.Doc = new HtmlDocument
+        {
+            OptionFixNestedTags = true,
+            OptionAutoCloseOnEnd = true
+        };
+
+        st.Doc.LoadHtml(html ?? "");
+        // normalisiert evtl. minimal -> ist ok
+        st.Html = st.Doc.DocumentNode.OuterHtml ?? (html ?? "");
+    }
+
+    private static int HtmlCount(HtmlState st, string selector)
+    {
+        int i = 0;
+        foreach (var _ in st.Doc.DocumentNode.QuerySelectorAll(selector)) i++;
+        return i;
+    }
+
+    private static HtmlNode? HtmlSelectFirst(HtmlState st, string selector)
+    {
+        return st.Doc.DocumentNode.QuerySelector(selector);
+    }
+
+    private static HtmlNode? HtmlSelectAt(HtmlState st, string selector, int idx)
+    {
+        if (idx < 0) return null;
+        int i = 0;
+        foreach (var n in st.Doc.DocumentNode.QuerySelectorAll(selector))
+        {
+            if (i == idx) return n;
+            i++;
+        }
+        return null;
+    }
+
+    private static void HtmlSyncToJs(JsObject obj, HtmlState st)
+    {
+        st.Html = st.Doc.DocumentNode.OuterHtml ?? "";
+        obj.Set("_html", JsValue.FromString(st.Html));
+    }
+
+    #endregion
+
     #region CSV Helpers
 
     // static/global irgendwo:
@@ -830,7 +887,6 @@ internal static class Program
 
     #endregion
 
-
     public static int Main(string[] args)
     {
 
@@ -841,6 +897,8 @@ internal static class Program
         }
 
         _js = new MiniJs();
+
+        #region Prototypes
 
         _js.Register("hostAdd", HostAdd);
 
@@ -1141,36 +1199,72 @@ internal static class Program
 
         using (JsClass html = _js.CreateClass("HTML"))
         {
-            // new Html([htmlString])
+            // new HTML([htmlString])
             html.AddMethod("constructor", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
 
                 string s = (a.Length > 0 && a[0].Type == Kind.String) ? (a[0].String ?? "") : "";
 
+                int id = _htmlNextId++;
+                var st = new HtmlState();
+                HtmlLoad(st, s);
+                _html[id] = st;
+
                 _js.RetainHandle(thisVal.Handle);
                 using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
                 {
-                    obj.Set("_html", JsValue.FromString(s));
+                    obj.Set("_id", JsValue.FromNumber(id));
+                    obj.Set("_html", JsValue.FromString(st.Html));
                     obj.Set("error", JsValue.Null());
                 }
+
                 return JsValue.Null();
             });
 
-            // setHtml(string)
+            // free() -> 1/0
+            html.AddMethod("free", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0) return JsValue.FromNumber(0);
+
+                return JsValue.FromNumber(_html.Remove(id) ? 1 : 0);
+            });
+
+            // setHtml(string) -> 1/0
             html.AddMethod("setHtml", (JsValue[] a, JsValue thisVal) =>
             {
-                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
 
                 string s = (a.Length > 0) ? (a[0].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    obj.Set("_html", JsValue.FromString(s));
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
                 }
-                return JsValue.Null();
+
+                try
+                {
+                    HtmlLoad(st, s);
+                    obj.Set("_html", JsValue.FromString(st.Html));
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
             });
 
             // html() -> whole html
@@ -1179,103 +1273,220 @@ internal static class Program
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st)) return JsValue.Null();
+
+                return JsValue.FromString(st.Html ?? "");
+            });
+
+            // count(selector) -> number
+            html.AddMethod("count", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    return JsValue.FromString(obj.Get("_html").String ?? "");
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    return JsValue.FromNumber(HtmlCount(st, sel));
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
-            // outerHTML(selector) -> string|null
+            // outerHTML(selector) -> first match
             html.AddMethod("outerHTML", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
                 string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
 
-                    try
-                    {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null) return JsValue.Null();
-
-                        return JsValue.FromString(node.OuterHtml ?? "");
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
-                        return JsValue.Null();
-                    }
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.OuterHtml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
                 }
             });
 
-            // innerHTML(selector) -> string|null
+            // outerHTMLAt(selector, index) -> nth match
+            html.AddMethod("outerHTMLAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.OuterHtml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            // innerHTML(selector)
             html.AddMethod("innerHTML", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
                 string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
 
-                    try
-                    {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null) return JsValue.Null();
-
-                        return JsValue.FromString(node.InnerHtml ?? "");
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
-                        return JsValue.Null();
-                    }
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.InnerHtml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
                 }
             });
 
-            // innerText(selector) -> string|null
+            // innerHTMLAt(selector, index)
+            html.AddMethod("innerHTMLAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.InnerHtml ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            // innerText(selector)
             html.AddMethod("innerText", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
                 string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
 
-                    try
-                    {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null) return JsValue.Null();
-
-                        return JsValue.FromString(node.InnerText ?? "");
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
-                        return JsValue.Null();
-                    }
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.InnerText ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
                 }
             });
 
-            // getAttr(selector, name) -> string|null
+            // innerTextAt(selector, index)
+            html.AddMethod("innerTextAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    return node == null ? JsValue.Null() : JsValue.FromString(node.InnerText ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
+
+            // getAttr(selector, name)
             html.AddMethod("getAttr", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
@@ -1283,29 +1494,62 @@ internal static class Program
                 string name = (a.Length > 1) ? (a[1].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
 
-                    try
-                    {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null) return JsValue.Null();
 
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null) return JsValue.Null();
+                    var attr = node.Attributes[name];
+                    return attr == null ? JsValue.Null() : JsValue.FromString(attr.Value ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
+                }
+            });
 
-                        var attr = node.Attributes[name];
-                        if (attr == null) return JsValue.Null();
+            // getAttrAt(selector, index, name)
+            html.AddMethod("getAttrAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+                string name = (a.Length > 2) ? (a[2].String ?? "") : "";
 
-                        return JsValue.FromString(attr.Value ?? "");
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
-                        return JsValue.Null();
-                    }
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.Null();
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    if (node == null) return JsValue.Null();
+
+                    var attr = node.Attributes[name];
+                    return attr == null ? JsValue.Null() : JsValue.FromString(attr.Value ?? "");
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.Null();
                 }
             });
 
@@ -1318,32 +1562,73 @@ internal static class Program
                 string value = (a.Length > 2) ? (a[2].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null)
                     {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null)
-                        {
-                            obj.Set("error", JsValue.FromString("Selector not found."));
-                            return JsValue.FromNumber(0);
-                        }
-
-                        node.SetAttributeValue(name, value);
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
+                        obj.Set("error", JsValue.FromString("Selector not found."));
                         return JsValue.FromNumber(0);
                     }
+
+                    node.SetAttributeValue(name, value);
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
+
+            // setAttrAt(selector, index, name, value) -> 1/0
+            html.AddMethod("setAttrAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+                string name = (a.Length > 2) ? (a[2].String ?? "") : "";
+                string value = (a.Length > 3) ? (a[3].String ?? "") : "";
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    if (node == null)
+                    {
+                        obj.Set("error", JsValue.FromString("Selector/index not found."));
+                        return JsValue.FromNumber(0);
+                    }
+
+                    node.SetAttributeValue(name, value);
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
@@ -1355,36 +1640,37 @@ internal static class Program
                 string frag = (a.Length > 1) ? (a[1].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null)
                     {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null)
-                        {
-                            obj.Set("error", JsValue.FromString("Selector not found."));
-                            return JsValue.FromNumber(0);
-                        }
-
-                        node.InnerHtml = frag;
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
+                        obj.Set("error", JsValue.FromString("Selector not found."));
                         return JsValue.FromNumber(0);
                     }
+
+                    node.InnerHtml = frag;
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
-            // setInnerText(selector, text) -> 1/0 (wird escaped)
+            // setInnerText(selector, text) -> 1/0 (escaped)
             html.AddMethod("setInnerText", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
@@ -1392,32 +1678,33 @@ internal static class Program
                 string txt = (a.Length > 1) ? (a[1].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null)
                     {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null)
-                        {
-                            obj.Set("error", JsValue.FromString("Selector not found."));
-                            return JsValue.FromNumber(0);
-                        }
-
-                        node.InnerHtml = HtmlEntity.Entitize(txt); // sicherer als raw InnerHtml
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
+                        obj.Set("error", JsValue.FromString("Selector not found."));
                         return JsValue.FromNumber(0);
                     }
+
+                    node.InnerHtml = HtmlEntity.Entitize(txt);
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
@@ -1429,32 +1716,33 @@ internal static class Program
                 string frag = (a.Length > 1) ? (a[1].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null)
                     {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null)
-                        {
-                            obj.Set("error", JsValue.FromString("Selector not found."));
-                            return JsValue.FromNumber(0);
-                        }
-
-                        node.InnerHtml = (node.InnerHtml ?? "") + frag;
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
+                        obj.Set("error", JsValue.FromString("Selector not found."));
                         return JsValue.FromNumber(0);
                     }
+
+                    node.InnerHtml = (node.InnerHtml ?? "") + frag;
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
@@ -1466,69 +1754,106 @@ internal static class Program
                 string frag = (a.Length > 1) ? (a[1].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null)
                     {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
-
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null)
-                        {
-                            obj.Set("error", JsValue.FromString("Selector not found."));
-                            return JsValue.FromNumber(0);
-                        }
-
-                        node.InnerHtml = frag + (node.InnerHtml ?? "");
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
+                        obj.Set("error", JsValue.FromString("Selector not found."));
                         return JsValue.FromNumber(0);
                     }
+
+                    node.InnerHtml = frag + (node.InnerHtml ?? "");
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
-            // remove(selector) -> 1/0
+            // remove(selector) -> 1/0 (first match)
             html.AddMethod("remove", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
                 string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
 
                 _js.RetainHandle(thisVal.Handle);
-                using (JsObject obj = new JsObject(_js, thisVal.Handle, true))
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
                 {
-                    obj.Set("error", JsValue.Null());
-                    string src = obj.Get("_html").String ?? "";
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
 
-                    try
-                    {
-                        var doc = new HtmlDocument();
-                        doc.LoadHtml(src);
+                try
+                {
+                    var node = HtmlSelectFirst(st, sel);
+                    if (node == null) return JsValue.FromNumber(0);
 
-                        var node = doc.DocumentNode.QuerySelector(sel);
-                        if (node == null) return JsValue.FromNumber(0);
+                    node.Remove();
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
+                }
+            });
 
-                        node.Remove();
-                        obj.Set("_html", JsValue.FromString(doc.DocumentNode.OuterHtml ?? ""));
-                        return JsValue.FromNumber(1);
-                    }
-                    catch (Exception ex)
-                    {
-                        obj.Set("error", JsValue.FromString(ex.Message));
-                        return JsValue.FromNumber(0);
-                    }
+            // removeAt(selector, index) -> 1/0
+            html.AddMethod("removeAt", (JsValue[] a, JsValue thisVal) =>
+            {
+                if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
+                string sel = (a.Length > 0) ? (a[0].String ?? "") : "";
+                int idx = (a.Length > 1 && a[1].Type == Kind.Number) ? (int)a[1].Number : 0;
+
+                _js.RetainHandle(thisVal.Handle);
+                using var obj = new JsObject(_js, thisVal.Handle, true);
+                obj.Set("error", JsValue.Null());
+
+                int id = (obj.Get("_id").Type == Kind.Number) ? (int)obj.Get("_id").Number : -1;
+                if (id < 0 || !_html.TryGetValue(id, out var st))
+                {
+                    obj.Set("error", JsValue.FromString("HTML state missing."));
+                    return JsValue.FromNumber(0);
+                }
+
+                try
+                {
+                    var node = HtmlSelectAt(st, sel, idx);
+                    if (node == null) return JsValue.FromNumber(0);
+
+                    node.Remove();
+                    HtmlSyncToJs(obj, st);
+                    return JsValue.FromNumber(1);
+                }
+                catch (Exception ex)
+                {
+                    obj.Set("error", JsValue.FromString(ex.Message));
+                    return JsValue.FromNumber(0);
                 }
             });
 
             html.DeclareToGlobals();
         }
+
 
         using (JsClass csv = _js.CreateClass("CSV")) // Script: new CSV()
         {
@@ -3899,6 +4224,7 @@ internal static class Program
             yaml.DeclareToGlobals();
         }
 
+        #endregion
 
         string code = File.ReadAllText(args[0]);
 
