@@ -3077,7 +3077,7 @@ internal static class Program
                 return JsValue.FromString("unknown");
             });
 
-            json.AddMethod("length", (JsValue[] a, JsValue thisVal) =>
+            json.AddMethod("len", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.FromNumber(0);
                 string path = (a.Length > 0) ? (a[0].String ?? "") : "";
