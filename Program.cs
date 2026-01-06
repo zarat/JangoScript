@@ -628,16 +628,34 @@ internal static class Program
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero)
                     return JsValue.Null();
 
-                MiniJs js = _js;
-                js.RetainHandle(thisVal.Handle);
+                _js.RetainHandle(thisVal.Handle);
 
-                string outstr = String.Empty;
+                var sb = new StringBuilder();
 
-                foreach (JsValue arg in args)
+                foreach (var arg in args)
                 {
-                    outstr += arg.String;
+                    switch (arg.Type)
+                    {
+                        case Kind.String:
+                            sb.Append(arg.String ?? "");
+                            break;
+
+                        case Kind.Number:
+                            sb.Append(arg.Number.ToString(CultureInfo.InvariantCulture));
+                            break;
+
+                        case Kind.Null:
+                            sb.Append("null");
+                            break;
+
+                        default:
+                            // fallback: wenn du für Object/Bool/etc. etwas besseres hast, hier rein
+                            sb.Append(arg.String ?? "");
+                            break;
+                    }
                 }
-                Console.Write(outstr);
+
+                Console.Write(sb.ToString());
                 return JsValue.Null();
             });
             console.AddMethod("read", (JsValue[] args, JsValue thisVal) =>
@@ -2822,7 +2840,7 @@ internal static class Program
             });
 
             // Send() => string (Text oder Base64, je nach Binary/ContentType)
-            http.AddMethod("Send", (JsValue[] a, JsValue thisVal) =>
+            http.AddMethod("send", (JsValue[] a, JsValue thisVal) =>
             {
                 if (thisVal.Type != Kind.Object || thisVal.Handle == IntPtr.Zero) return JsValue.Null();
 
@@ -2926,17 +2944,6 @@ internal static class Program
                     obj.Set("error", JsValue.FromString(ex.Message));
                     return JsValue.Null();
                 }
-            });
-
-            // send() alias
-            http.AddMethod("send", (JsValue[] a, JsValue thisVal) =>
-            {
-                // einfach Send() nochmal aufrufen via Copy-Paste wäre deppert;
-                // wir machen direkt dasselbe wie Send, aber minimal:
-                // -> call Send by using the same handler name in JS: "Send"
-                // MiniJsHost hat keinen direkten "invoke other method", daher: duplicate mit minimal overhead
-                // (Wenn dich das stört: lösch alias und nutz nur Send())
-                return JsValue.Null();
             });
 
             // openstream()
